@@ -1,0 +1,4 @@
+# This project currently uses only the Python standard library.
+# (We parse .env ourselves to avoid extra dependencies.)
+
+
