@@ -1,9 +1,3 @@
-"""
-GitHub Security Advisory (Global Advisories) API client.
-
-Docs: https://docs.github.com/en/rest/security-advisories?apiVersion=2022-11-28
-"""
-
 from __future__ import annotations
 
 import json
@@ -12,19 +6,22 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from typing import Any, Dict, Iterator, List, Mapping, Optional
+from typing import Any, Iterator, Optional
 
 
 @dataclass(frozen=True)
 class GitHubAdvisoryClient:
-    token: Optional[str] = None
-    api_base_url: str = "https://api.github.com"
-    api_version: str = "2022-11-28"
-    user_agent: str = "dataset-generator/0.1"
-    request_timeout_s: int = 30
+    """Client for fetching advisories from GitHub's global security advisories API."""
 
-    def _headers(self) -> Dict[str, str]:
-        headers: Dict[str, str] = {
+    token: Optional[str]
+    api_base_url: str
+    api_version: str
+    user_agent: str
+    request_timeout_s: int
+
+    def _build_headers(self) -> dict[str, str]:
+        """Build HTTP headers for GitHub API requests."""
+        headers: dict[str, str] = {
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": self.api_version,
             "User-Agent": self.user_agent,
@@ -33,47 +30,71 @@ class GitHubAdvisoryClient:
             headers["Authorization"] = f"Bearer {self.token}"
         return headers
 
-    def _get_json(self, path: str, *, query: Optional[Mapping[str, Any]] = None) -> Any:
-        url = self.api_base_url.rstrip("/") + "/" + path.lstrip("/")
-        if query:
-            q = {k: v for k, v in query.items() if v is not None}
-            url = url + "?" + urllib.parse.urlencode(q, doseq=True)
+    def _fetch_json(
+        self, 
+        path: str, 
+        query_params: Optional[dict[str, Any]] = None
+    ) -> Any:
+        """Make a GET request to the GitHub API and return JSON response."""
+        url = f"{self.api_base_url.rstrip('/')}/{path.lstrip('/')}"
+        
+        if query_params:
+            # Filter out None values
+            filtered_params = {k: v for k, v in query_params.items() if v is not None}
+            if filtered_params:
+                url = f"{url}?{urllib.parse.urlencode(filtered_params, doseq=True)}"
 
-        req = urllib.request.Request(url=url, method="GET", headers=self._headers())
+        request = urllib.request.Request(
+            url=url, 
+            method="GET", 
+            headers=self._build_headers()
+        )
 
         try:
-            with urllib.request.urlopen(req, timeout=self.request_timeout_s) as resp:
-                raw = resp.read()
-                charset = resp.headers.get_content_charset() or "utf-8"
-                text = raw.decode(charset, errors="replace")
+            with urllib.request.urlopen(request, timeout=self.request_timeout_s) as response:
+                content = response.read()
+                encoding = response.headers.get_content_charset() or "utf-8"
+                text = content.decode(encoding, errors="replace")
                 return json.loads(text) if text else None
-        except urllib.error.HTTPError as e:
-            body = ""
-            try:
-                body = e.read().decode("utf-8", errors="replace")
-            except Exception:
-                body = ""
-            msg = body or getattr(e, "reason", "") or "HTTP error"
-            raise RuntimeError(f"GitHub API error {e.code} for {url}: {msg}") from e
+                
+        except urllib.error.HTTPError as error:
+            error_message = self._extract_error_message(error)
+            raise RuntimeError(
+                f"GitHub API request failed (HTTP {error.code}): {error_message}"
+            ) from error
 
-    def list_advisories(
+    @staticmethod
+    def _extract_error_message(error: urllib.error.HTTPError) -> str:
+        """Extract error message from HTTP error response."""
+        try:
+            return error.read().decode("utf-8", errors="replace")
+        except Exception:
+            return getattr(error, "reason", "Unknown error")
+
+    def fetch_advisories(
         self,
-        *,
         ecosystem: Optional[str] = None,
         severity: Optional[str] = None,
         advisory_type: Optional[str] = None,
         per_page: int = 100,
         page: int = 1,
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """
-        List a page of global security advisories.
-
-        Endpoint: GET /advisories
-        Docs: https://docs.github.com/en/rest/security-advisories?apiVersion=2022-11-28
+        Fetch a single page of security advisories.
+        
+        Args:
+            ecosystem: Filter by package ecosystem (e.g., 'pip', 'npm')
+            severity: Filter by severity level (e.g., 'critical', 'high')
+            advisory_type: Filter by type (e.g., 'malware', 'reviewed')
+            per_page: Number of results per page (max 100)
+            page: Page number to fetch
+            
+        Returns:
+            List of advisory dictionaries
         """
-        data = self._get_json(
+        response = self._fetch_json(
             "/advisories",
-            query={
+            query_params={
                 "ecosystem": ecosystem,
                 "severity": severity,
                 "type": advisory_type,
@@ -81,42 +102,53 @@ class GitHubAdvisoryClient:
                 "page": page,
             },
         )
-        if not isinstance(data, list):
-            raise RuntimeError(f"Unexpected response type for /advisories: {type(data)}")
-        return [d for d in data if isinstance(d, dict)]
+        
+        if not isinstance(response, list):
+            raise RuntimeError(
+                f"Expected list response from API, got {type(response).__name__}"
+            )
+        
+        return [item for item in response if isinstance(item, dict)]
 
     def iter_advisories(
         self,
-        *,
         ecosystem: Optional[str] = None,
         severity: Optional[str] = None,
         advisory_type: Optional[str] = None,
         per_page: int = 100,
         max_pages: Optional[int] = None,
         sleep_s: float = 0.0,
-    ) -> Iterator[Dict[str, Any]]:
+    ) -> Iterator[dict[str, Any]]:
         """
-        Iterate advisories, page by page, until GitHub returns an empty list.
+        Iterate through all advisories across multiple pages.
+        
+        Args:
+            ecosystem: Filter by package ecosystem
+            severity: Filter by severity level
+            advisory_type: Filter by advisory type
+            per_page: Number of results per page
+            max_pages: Maximum number of pages to fetch (None for all)
+            delay_seconds: Delay between requests to respect rate limits
+            
+        Yields:
+            Individual advisory dictionaries
         """
         page = 1
-        while True:
-            if max_pages is not None and page > max_pages:
-                return
-
-            items = self.list_advisories(
+        
+        while max_pages is None or page <= max_pages:
+            advisories = self.fetch_advisories(
                 ecosystem=ecosystem,
                 severity=severity,
                 advisory_type=advisory_type,
                 per_page=per_page,
                 page=page,
             )
-            if not items:
-                return
+            
+            if not advisories:
+                break
 
-            for item in items:
-                yield item
+            yield from advisories
 
             page += 1
             if sleep_s > 0:
                 time.sleep(sleep_s)
-
